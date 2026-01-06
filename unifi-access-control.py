@@ -717,7 +717,7 @@ def make_schedule_handler(friendly_name):
 
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
-    ui.label('Home Network - Control Panel v2.3').classes('text-2xl mb-6')
+    ui.label('Home Network - Control Panel v4.0.1').classes('text-2xl mb-6 text-center w-full')
     
     # Connection status indicator
     status_label_ref[0] = ui.label('Connecting to UniFi controller...').classes('text-sm mb-2')
@@ -735,8 +735,10 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
     update_connection_status()
     
     device_map = get_blocked()
-    for friendly_name, info in device_map.items():
-        with ui.column().classes('w-full gap-1 mb-2'):
+    for idx, (friendly_name, info) in enumerate(device_map.items()):
+        # Alternate background colors: very dark blue (even) and lighter blue (odd)
+        bg_color = 'bg-blue-950' if idx % 2 == 0 else 'bg-blue-800'
+        with ui.column().classes(f'w-full gap-1 mb-0 {bg_color} p-2 rounded'):
             with ui.row().classes('items-center gap-4 w-full'):
                 sw = ui.switch(
                     friendly_name,
@@ -758,7 +760,7 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
                     schedule_button.classes('bg-gray-500 text-white')
             
             # Info row with countdown, schedule, and state history
-            info_row = ui.row().classes('items-center gap-4 w-full pl-4 flex-wrap min-h-[20px]')
+            info_row = ui.row().classes('items-center gap-4 w-full pl-4 flex-wrap min-h-[16px]')
             with info_row:
                 # Show temporary access countdown (always create, show/hide based on state)
                 countdown_label = ui.label('').classes('text-xs text-orange-500 font-mono font-bold')
@@ -781,9 +783,6 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
                 disabled_label = ui.label('').classes('text-xs text-red-500')
                 disabled_labels[friendly_name] = disabled_label
                 disabled_label.style('display: none')
-            
-            # Add dividing line between device entries
-            ui.separator().classes('w-full my-2')
 
 def update_countdowns():
     """Update all countdown labels with remaining time and check for expired access"""
