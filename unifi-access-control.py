@@ -546,17 +546,19 @@ def check_schedules():
         #   - Unblocked from 15:00 to 02:00 next day (spans midnight)
         #
         # If unblock_time > block_time: Midnight-spanning schedule
-        #   - Blocked: from block_time to unblock_time (same day), OR before block_time (still in previous day's block period)
-        #   - Unblocked: from unblock_time to block_time next day
-        #   - Logic: blocked if (now >= block_time AND now < unblock_time) OR (now < block_time)
+        #   - Unblocked: from unblock_time to block_time next day (spans midnight)
+        #   - Blocked: from block_time to unblock_time (same day)
+        #   - Logic: unblocked if (now >= unblock_time) OR (now < block_time)
+        #            blocked if (block_time <= now < unblock_time)
         #
         # If unblock_time < block_time: Normal same-day schedule (no midnight crossing)
         #   - Blocked: from block_time to unblock_time next day (spans midnight)
         #   - Unblocked: from unblock_time to block_time (same day)
         #   - Logic: blocked if now >= block_time OR now < unblock_time
         if unblock_time > block_time:
-            # Midnight-spanning: blocked from block_time to unblock_time, or before block_time (previous day's block period)
-            should_be_blocked = (now >= block_time and now < unblock_time) or (now < block_time)
+            # Midnight-spanning: unblocked from unblock_time to block_time next day
+            # Blocked from block_time to unblock_time
+            should_be_blocked = block_time <= now < unblock_time
         else:
             # Normal same-day schedule: blocked from block_time to unblock_time next day
             should_be_blocked = now >= block_time or now < unblock_time
@@ -717,7 +719,7 @@ def make_schedule_handler(friendly_name):
 
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
-    ui.label('Home Network - Control Panel v4.0.1').classes('text-2xl mb-6 text-center w-full')
+    ui.label('Home Network - Control Panel v4.0.2').classes('text-2xl mb-6 text-center w-full')
     
     # Connection status indicator
     status_label_ref[0] = ui.label('Connecting to UniFi controller...').classes('text-sm mb-2')
