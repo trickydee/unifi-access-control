@@ -87,7 +87,7 @@ This file defines the devices you want to manage, their MAC addresses, and optio
 ```
 
 **Fields:**
-- `Device Friendly Name`: A descriptive name for the device (e.g., "Charlie iPhone", "James Gaming PC")
+- `Device Friendly Name`: A descriptive name for the device (e.g., "Bobs PC", "Freds Laptop", "Sallys MacBook")
 - `mac`: The MAC address of the device in `aa:bb:cc:dd:ee:ff` format
 - `schedule` (optional): Schedule configuration object
   - `enabled`: Boolean - whether the schedule is active
@@ -105,18 +105,26 @@ This file defines the devices you want to manage, their MAC addresses, and optio
 **Example:**
 ```json
 {
-  "Charlie iPhone": {
-    "mac": "14:2d:4d:d2:d8:9f",
+  "Bobs PC": {
+    "mac": "aa:bb:cc:dd:ee:ff",
     "schedule": {
       "enabled": true,
       "block_time": "22:00",
       "unblock_time": "07:00"
     }
   },
-  "James Gaming PC": {
-    "mac": "00:11:22:33:44:55",
+  "Freds Laptop": {
+    "mac": "11:22:33:44:55:66",
     "schedule": {
       "enabled": false
+    }
+  },
+  "Sallys MacBook": {
+    "mac": "aa:11:bb:22:cc:33",
+    "schedule": {
+      "enabled": true,
+      "block_time": "23:00",
+      "unblock_time": "08:00"
     }
   }
 }
