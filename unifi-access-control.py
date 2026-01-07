@@ -47,15 +47,40 @@ def update_schedule_times(friendly_name, block_time_str, unblock_time_str):
         devices_config[friendly_name]["schedule"]["enabled"] = True
         save_devices(devices_config)
         print(f"[SCHEDULE] Updated schedule for {friendly_name}: {unblock_time_str} - {block_time_str}")
+        # Update UI
+        update_schedule_display(friendly_name)
         return True
     return False
+
+def update_schedule_display(friendly_name):
+    """Update the schedule label and button in the UI"""
+    if friendly_name in devices_config:
+        schedule = devices_config[friendly_name].get("schedule", {})
+        schedule_enabled = schedule.get("enabled", False)
+        
+        # Update schedule label
+        if friendly_name in schedule_labels and schedule_labels[friendly_name]:
+            if schedule_enabled:
+                block_time = schedule.get("block_time", "N/A")
+                unblock_time = schedule.get("unblock_time", "N/A")
+                schedule_labels[friendly_name].text = f"📅 Schedule: {unblock_time} - {block_time}"
+                schedule_labels[friendly_name].style('display: block')
+            else:
+                schedule_labels[friendly_name].style('display: none')
+        
+        # Update schedule button color
+        if friendly_name in schedule_buttons and schedule_buttons[friendly_name]:
+            if schedule_enabled:
+                schedule_buttons[friendly_name].classes('bg-blue-500 text-white', remove='bg-gray-500')
+            else:
+                schedule_buttons[friendly_name].classes('bg-gray-500 text-white', remove='bg-blue-500')
 
 # Persistence for temporary access and device state
 PERSISTENCE_FILE = 'device_state.json'
 
 def load_persistence():
     """Load temporary access and device state history from file"""
-    global temporary_access, device_state_history, manual_overrides
+    global temporary_access, device_state_history, manual_overrides, event_log
     # Initialize if not already initialized
     if 'temporary_access' not in globals():
         temporary_access = {}
@@ -63,6 +88,8 @@ def load_persistence():
         device_state_history = {}
     if 'manual_overrides' not in globals():
         manual_overrides = {}
+    if 'event_log' not in globals():
+        event_log = []
     if os.path.exists(PERSISTENCE_FILE):
         try:
             with open(PERSISTENCE_FILE, 'r') as f:
@@ -102,6 +129,22 @@ def load_persistence():
                                 print(f"[PERSISTENCE] Error restoring disabled time for {name}: {e}")
                     if restored_history_count > 0:
                         print(f"[PERSISTENCE] Restored state history for {len(device_state_history)} devices")
+                # Load manual overrides
+                if 'manual_overrides' in data:
+                    manual_overrides.update(data['manual_overrides'])
+                    if len(data['manual_overrides']) > 0:
+                        print(f"[PERSISTENCE] Restored {len(data['manual_overrides'])} manual overrides")
+                # Load event log
+                if 'event_log' in data:
+                    event_log.clear()
+                    for event in data['event_log']:
+                        try:
+                            event['timestamp'] = datetime.fromisoformat(event['timestamp'])
+                            event_log.append(event)
+                        except Exception as e:
+                            print(f"[PERSISTENCE] Error restoring event: {e}")
+                    if len(data['event_log']) > 0:
+                        print(f"[PERSISTENCE] Restored {len(data['event_log'])} events from log")
         except Exception as e:
             print(f"Error loading persistence: {e}")
 
@@ -120,7 +163,16 @@ def save_persistence():
                 }
                 for name, history in device_state_history.items()
             },
-            'manual_overrides': manual_overrides.copy()
+            'manual_overrides': manual_overrides.copy(),
+            'event_log': [
+                {
+                    'timestamp': event['timestamp'].isoformat(),
+                    'device': event['device'],
+                    'event': event['event'],
+                    'details': event.get('details', '')
+                }
+                for event in event_log[-100:]  # Keep last 100 events
+            ]
         }
         with open(PERSISTENCE_FILE, 'w') as f:
             json.dump(data, f, indent=2)
@@ -141,9 +193,12 @@ temporary_access = {}  # {device_name: datetime when it should be blocked again}
 schedule_timers = {}  # Track scheduled block/unblock timers
 status_label_ref = [None]  # Will be set when UI is built (using list for mutable reference)
 device_state_history = {}  # {device_name: {"last_enabled": datetime, "last_disabled": datetime}}
+event_log = []  # List of events: [{"timestamp": datetime, "device": str, "event": str, "details": str}, ...]
 countdown_labels = {}  # {device_name: ui.label} for countdown display
 enabled_labels = {}  # {device_name: ui.label} for enabled time display
 disabled_labels = {}  # {device_name: ui.label} for disabled time display
+schedule_labels = {}  # {device_name: ui.label} for schedule display
+schedule_buttons = {}  # {device_name: ui.button} for schedule button references
 _programmatic_switch_update = set()  # Track devices being updated programmatically to prevent handler clearing temporary_access
 manual_overrides = {}  # {device_name: True/False} - tracks manual toggle state (True=enabled, False=disabled)
 
@@ -331,6 +386,17 @@ def turn_on(friendly_name, mac_address, is_manual=True):
             device_state_history[friendly_name] = {}
         device_state_history[friendly_name]['last_enabled'] = datetime.now()
         
+        # Add to event log (only if not a programmatic update from schedule/temporary access)
+        # Programmatic updates are already logged by the schedule/temporary access functions
+        if friendly_name not in _programmatic_switch_update:
+            event_type = "Enabled (Manual)" if is_manual else "Enabled (Schedule)"
+            event_log.append({
+                'timestamp': datetime.now(),
+                'device': friendly_name,
+                'event': event_type,
+                'details': ''
+            })
+        
         # Track manual override if this was a manual action
         if is_manual and friendly_name not in _programmatic_switch_update:
             manual_overrides[friendly_name] = True  # Manual override: enabled
@@ -354,7 +420,7 @@ def turn_on(friendly_name, mac_address, is_manual=True):
         return False
 
 def turn_off(friendly_name, mac_address, is_manual=True):
-    global cached_device_status, cache_valid_until, rate_limit_until, c, device_state_history, manual_overrides
+    global cached_device_status, cache_valid_until, rate_limit_until, c, device_state_history, manual_overrides, event_log
     if check_rate_limit():
         print(f"Rate limited, cannot block {friendly_name} right now")
         return False
@@ -376,6 +442,17 @@ def turn_off(friendly_name, mac_address, is_manual=True):
         if friendly_name not in device_state_history:
             device_state_history[friendly_name] = {}
         device_state_history[friendly_name]['last_disabled'] = datetime.now()
+        
+        # Add to event log (only if not a programmatic update from schedule/temporary access)
+        # Programmatic updates are already logged by the schedule/temporary access functions
+        if friendly_name not in _programmatic_switch_update:
+            event_type = "Disabled (Manual)" if is_manual else "Disabled (Schedule)"
+            event_log.append({
+                'timestamp': datetime.now(),
+                'device': friendly_name,
+                'event': event_type,
+                'details': ''
+            })
         
         # Track manual override if this was a manual action
         if is_manual and friendly_name not in _programmatic_switch_update:
@@ -401,7 +478,7 @@ def turn_off(friendly_name, mac_address, is_manual=True):
 
 def turn_on_temporary(friendly_name, mac_address, minutes):
     """Unblock a device temporarily for X minutes"""
-    global cached_device_status, cache_valid_until, rate_limit_until, c, device_state_history, manual_overrides, manual_overrides
+    global cached_device_status, cache_valid_until, rate_limit_until, c, device_state_history, manual_overrides, event_log
     if check_rate_limit():
         print(f"Rate limited, cannot grant temporary access to {friendly_name} right now")
         return False
@@ -429,6 +506,14 @@ def turn_on_temporary(friendly_name, mac_address, minutes):
         if friendly_name not in device_state_history:
             device_state_history[friendly_name] = {}
         device_state_history[friendly_name]['last_enabled'] = datetime.now()
+        
+        # Add to event log
+        event_log.append({
+            'timestamp': datetime.now(),
+            'device': friendly_name,
+            'event': 'Temporary Access Granted',
+            'details': f'{minutes} minutes (expires at {block_time.strftime("%H:%M:%S")})'
+        })
         
         # Clear manual override when temporary access is granted (temporary access takes priority)
         if friendly_name in manual_overrides:
@@ -533,7 +618,14 @@ def check_schedules():
             debug_log(f"[SCHEDULE] {friendly_name}: Skipping (temporary access active)")
             continue  # Skip schedule check if temporary access is active
         
-        current_status = get_blocked().get(friendly_name, {}).get("blocked", False)
+        # Get current status - use cached data to avoid rate limiting
+        # Force a refresh only if cache is very stale (older than 30 seconds)
+        device_map = get_blocked(force_refresh=False)
+        device_info = device_map.get(friendly_name)
+        if device_info is None:
+            print(f"[SCHEDULE] WARNING: {friendly_name} not found in device map, skipping")
+            continue
+        current_status = device_info.get("blocked", False)
         now_str = now.strftime('%H:%M:%S')
         
         # Handle schedule logic
@@ -563,7 +655,8 @@ def check_schedules():
             # Normal same-day schedule: blocked from block_time to unblock_time next day
             should_be_blocked = now >= block_time or now < unblock_time
         
-        debug_log(f"[SCHEDULE] {friendly_name}: now={now_str}, block={block_time_str}, unblock={unblock_time_str}, should_be_blocked={should_be_blocked}, current_status={current_status}")
+        # Enhanced logging for debugging schedule issues
+        print(f"[SCHEDULE] {friendly_name}: now={now_str}, block={block_time_str}, unblock={unblock_time_str}, should_be_blocked={should_be_blocked}, current_status={current_status}, has_manual_override={friendly_name in manual_overrides}")
         
         # Check if there's a manual override
         has_manual_override = friendly_name in manual_overrides
@@ -573,28 +666,43 @@ def check_schedules():
         # Manual override persists until schedule actually takes action (opposite of manual state)
         if should_be_blocked and not current_status:
             # Schedule wants to block, but check manual override
+            # If manual override says enabled, skip blocking - let manual override persist until next block time
             if has_manual_override and manual_override_value is True:
-                # Manual override says enabled - schedule wants blocked, but user manually enabled it
-                # Don't apply schedule, let manual override persist
-                debug_log(f"[SCHEDULE] {friendly_name}: Skipping block (manual override: enabled)")
+                print(f"[SCHEDULE] {friendly_name}: Skipping block (manual override: enabled - will stay enabled until next block time)")
             else:
-                # No manual override or manual override says disabled - apply schedule
                 print(f"[SCHEDULE] Blocking {friendly_name} (scheduled: {block_time_str} - {unblock_time_str})")
+                # Apply schedule - turn_off will clear the manual override since is_manual=False
                 if turn_off(friendly_name, mac, is_manual=False):
                     if friendly_name in switches:
+                        # Mark as programmatic update to prevent switch handler from logging duplicate event
+                        _programmatic_switch_update.add(friendly_name)
                         switches[friendly_name].value = False
+                        # Remove from programmatic set after a short delay
+                        def clear_programmatic_flag():
+                            _programmatic_switch_update.discard(friendly_name)
+                        ui.timer(0.1, clear_programmatic_flag, once=True)
         elif not should_be_blocked and current_status:
             # Schedule wants to unblock, but check manual override
+            # If manual override says disabled, skip unblocking - let manual override persist until next unblock time
             if has_manual_override and manual_override_value is False:
-                # Manual override says disabled - schedule wants unblocked, but user manually disabled it
-                # Don't apply schedule, let manual override persist
-                debug_log(f"[SCHEDULE] {friendly_name}: Skipping unblock (manual override: disabled)")
+                print(f"[SCHEDULE] {friendly_name}: Skipping unblock (manual override: disabled - will stay disabled until next unblock time)")
             else:
-                # No manual override or manual override says enabled - apply schedule
                 print(f"[SCHEDULE] Unblocking {friendly_name} (scheduled: {block_time_str} - {unblock_time_str})")
+                # Apply schedule - turn_on will clear the manual override since is_manual=False
                 if turn_on(friendly_name, mac, is_manual=False):
                     if friendly_name in switches:
+                        # Mark as programmatic update to prevent switch handler from logging duplicate event
+                        _programmatic_switch_update.add(friendly_name)
                         switches[friendly_name].value = True
+                        # Remove from programmatic set after a short delay
+                        def clear_programmatic_flag():
+                            _programmatic_switch_update.discard(friendly_name)
+                        ui.timer(0.1, clear_programmatic_flag, once=True)
+                else:
+                    print(f"[SCHEDULE] ERROR: Failed to unblock {friendly_name}")
+        elif not should_be_blocked and not current_status:
+            # Device should be unblocked and already is - this is fine, just log for debugging
+            debug_log(f"[SCHEDULE] {friendly_name}: Already unblocked (as scheduled)")
 
 def make_switch_handler(friendly_name, mac_address):
     def handler(e: ValueChangeEventArguments):
@@ -648,6 +756,61 @@ def make_temporary_button_handler(friendly_name, mac_address):
                 ui.button('Grant Access', on_click=grant_and_update)
         dialog.open()
     return handler
+
+def show_event_log():
+    """Show event log dialog with scrollable list of events"""
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-2xl max-h-[80vh]'):
+        with ui.row().classes('w-full items-center justify-between mb-4'):
+            ui.label('Event Log').classes('text-xl font-bold')
+            ui.button('🗑️ Clear Log', on_click=lambda: clear_event_log(dialog)).classes('bg-red-600 text-white')
+        # Scrollable container for events
+        with ui.column().classes('w-full gap-2 overflow-y-auto max-h-[60vh]'):
+            if not event_log:
+                ui.label('No events recorded yet').classes('text-gray-500 text-center py-4')
+            else:
+                # Show events in reverse chronological order (newest first)
+                for event in reversed(event_log[-50:]):  # Show last 50 events
+                    timestamp = event['timestamp']
+                    time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                    device = event['device']
+                    event_type = event['event']
+                    details = event.get('details', '')
+                    
+                    # Color code by event type
+                    if 'Enabled' in event_type:
+                        bg_color = 'bg-green-900'
+                        icon = '✅'
+                    elif 'Disabled' in event_type:
+                        bg_color = 'bg-red-900'
+                        icon = '❌'
+                    elif 'Temporary' in event_type:
+                        bg_color = 'bg-orange-900'
+                        icon = '⏱'
+                    else:
+                        bg_color = 'bg-gray-800'
+                        icon = 'ℹ'
+                    
+                    with ui.card().classes(f'{bg_color} p-2 text-sm'):
+                        with ui.row().classes('items-center gap-2 w-full'):
+                            ui.label(icon).classes('text-lg')
+                            ui.label(f'{time_str}').classes('text-gray-300 font-mono text-xs')
+                            ui.label(f'{device}').classes('font-bold flex-1')
+                            ui.label(f'{event_type}').classes('text-gray-200')
+                        if details:
+                            ui.label(details).classes('text-gray-400 text-xs pl-6')
+        
+        ui.button('Close', on_click=dialog.close).classes('mt-4')
+        dialog.open()
+
+def clear_event_log(dialog):
+    """Clear the event log"""
+    global event_log
+    event_log.clear()
+    save_persistence()
+    ui.notify('Event log cleared', type='positive')
+    dialog.close()
+    # Reopen the dialog to show empty log
+    show_event_log()
 
 def make_schedule_handler(friendly_name):
     """Create handler for schedule button"""
@@ -709,6 +872,8 @@ def make_schedule_handler(friendly_name):
                         # Reload devices config to get updated schedule
                         global devices_config
                         devices_config = load_devices()
+                        # Update UI display
+                        update_schedule_display(friendly_name)
                         refresh_status()
                     except ValueError:
                         ui.notify('Invalid time format. Use HH:MM (e.g., 22:00)', type='negative')
@@ -719,7 +884,9 @@ def make_schedule_handler(friendly_name):
 
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
-    ui.label('Home Network - Control Panel v4.0.2').classes('text-2xl mb-6 text-center w-full')
+    with ui.row().classes('w-full items-center justify-center gap-4 mb-4'):
+        ui.label('Home Network - Control Panel v4.0.4').classes('text-2xl text-center')
+        ui.button('📋 Event Log', on_click=lambda: show_event_log()).classes('bg-gray-600 text-white')
     
     # Connection status indicator
     status_label_ref[0] = ui.label('Connecting to UniFi controller...').classes('text-sm mb-2')
@@ -770,12 +937,17 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
                 if friendly_name not in temporary_access:
                     countdown_label.style('display: none')
                 
-                # Show schedule status if enabled
+                # Show schedule status if enabled (create label and store reference)
                 schedule = devices_config.get(friendly_name, {}).get("schedule", {})
+                schedule_label = ui.label('').classes('text-xs text-gray-500')
+                schedule_labels[friendly_name] = schedule_label  # Store reference for updates
                 if schedule.get("enabled", False):
                     block_time = schedule.get("block_time", "N/A")
                     unblock_time = schedule.get("unblock_time", "N/A")
-                    ui.label(f"📅 Schedule: {unblock_time} - {block_time}").classes('text-xs text-gray-500')
+                    schedule_label.text = f"📅 Schedule: {unblock_time} - {block_time}"
+                    schedule_label.style('display: block')
+                else:
+                    schedule_label.style('display: none')
                 
                 # Show last enabled/disabled times (create labels that will be updated dynamically)
                 enabled_label = ui.label('').classes('text-xs text-green-500')
@@ -805,7 +977,14 @@ def update_countdowns():
         if friendly_name in devices_config:
             mac = devices_config[friendly_name]["mac"]
             print(f"Temporary access expired for {friendly_name}, blocking...")
-            turn_off(friendly_name, mac)
+            # Add to event log before blocking
+            event_log.append({
+                'timestamp': datetime.now(),
+                'device': friendly_name,
+                'event': 'Temporary Access Expired',
+                'details': 'Auto-blocked after temporary access period ended'
+            })
+            turn_off(friendly_name, mac, is_manual=False)
             del temporary_access[friendly_name]
             save_persistence()
             # Update UI switch
