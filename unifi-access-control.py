@@ -204,6 +204,7 @@ enabled_labels = {}  # {device_name: ui.label} for enabled time display
 disabled_labels = {}  # {device_name: ui.label} for disabled time display
 schedule_labels = {}  # {device_name: ui.label} for schedule display
 schedule_buttons = {}  # {device_name: ui.button} for schedule button references
+status_chips = {}  # {device_name: ui.chip} for online status display
 _programmatic_switch_update = set()  # Track devices being updated programmatically to prevent handler clearing temporary_access
 manual_overrides = {}  # {device_name: True/False} - tracks manual toggle state (True=enabled, False=disabled)
 
@@ -980,10 +981,75 @@ def make_schedule_handler(friendly_name):
         dialog.open()
     return handler
 
+def update_chip_statuses():
+    """Update online status chips by pinging devices"""
+    for friendly_name in devices_config.keys():
+        if friendly_name not in status_chips or status_chips[friendly_name] is None:
+            continue
+        
+        device_info = devices_config[friendly_name]
+        ip_address = device_info.get("ip_address")
+        
+        if not ip_address:
+            # No IP address configured, hide chip
+            status_chips[friendly_name].style('display: none')
+            continue
+        
+        # Show chip
+        status_chips[friendly_name].style('display: block')
+        
+        # Ping the device
+        is_online = ping_device(ip_address, count=1, timeout=2)
+        
+        # Update chip based on ping result
+        # Delete old chip and create new one using NiceGUI native chip function
+        chip = status_chips[friendly_name]
+        chip_containers = globals().get('chip_containers', {})
+        
+        try:
+            # Delete the old chip
+            chip.delete()
+            
+            # Get container and create new chip with correct state using native NiceGUI chip function
+            if friendly_name in chip_containers:
+                container = chip_containers[friendly_name]
+                # Clear container and add new chip
+                container.clear()
+                with container:
+                    if is_online is True:
+                        # Device is online - green outlined chip with checkmark
+                        status_chips[friendly_name] = ui.chip('Online', icon='check', color='green').props('square')
+                    elif is_online is False:
+                        # Device is offline - gray outlined chip  
+                        status_chips[friendly_name] = ui.chip('Offline', icon='close', color='grey').props('square')
+                    else:
+                        # Error pinging - red outlined chip
+                        status_chips[friendly_name] = ui.chip('Unknown', icon='warning', color='red').props('square')
+            else:
+                # Container not found - create chip without container (may appear in wrong location)
+                if is_online is True:
+                    status_chips[friendly_name] = ui.chip('Online', icon='check', color='green').props('square')
+                elif is_online is False:
+                    status_chips[friendly_name] = ui.chip('Offline', icon='close', color='grey').props('square')
+                else:
+                    status_chips[friendly_name] = ui.chip('Unknown', icon='warning', color='red').props('square')
+        except Exception as e:
+            debug_log(f"Error updating chip for {friendly_name}: {e}")
+            # If deletion/recreation fails, try to recreate chip anyway
+            try:
+                if is_online is True:
+                    status_chips[friendly_name] = ui.chip('Online', icon='check', color='green').props('square')
+                elif is_online is False:
+                    status_chips[friendly_name] = ui.chip('Offline', icon='close', color='grey').props('square')
+                else:
+                    status_chips[friendly_name] = ui.chip('Unknown', icon='warning', color='red').props('square')
+            except:
+                pass
+
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
     with ui.row().classes('w-full items-center justify-center gap-4 mb-4'):
-        ui.label('Home Network - Control Panel v4.0.5').classes('text-2xl text-center')
+        ui.label('Home Network - Control Panel v4.0.6').classes('text-2xl text-center')
         ui.button('📋 Event Log', on_click=lambda: show_event_log()).classes('bg-gray-600 text-white')
     
     # Connection status indicator
@@ -1001,6 +1067,9 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
     # Try initial connection (non-blocking)
     update_connection_status()
     
+    # Initial chip status update
+    ui.timer(2.0, update_chip_statuses, once=True)  # Update chip statuses once after UI loads
+    
     device_map = get_blocked()
     for idx, (friendly_name, info) in enumerate(device_map.items()):
         # Alternate background colors: very dark blue (even) and lighter blue (odd)
@@ -1013,6 +1082,23 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
                     on_change=make_switch_handler(friendly_name, info["mac"])
                 ).classes('flex-1')
                 switches[friendly_name] = sw
+                
+                # Online status chip (only shown if IP address is configured)
+                device_info = devices_config.get(friendly_name, {})
+                ip_address = device_info.get("ip_address")
+                if ip_address:
+                    # Create a container div for the chip so we can replace it when updating
+                    chip_container = ui.element('div').classes('inline-block')
+                    with chip_container:
+                        # Create chip with initial "Unknown" state (will be updated by timer)
+                        status_chip = ui.chip('Unknown', icon='warning', color='red').props('square')
+                        status_chips[friendly_name] = status_chip
+                    # Store container reference for updates
+                    if 'chip_containers' not in globals():
+                        globals()['chip_containers'] = {}
+                    globals()['chip_containers'][friendly_name] = chip_container
+                else:
+                    status_chips[friendly_name] = None
                 
                 # Temporary access button
                 ui.button('+30 min', on_click=make_temporary_button_handler(friendly_name, info["mac"]))
@@ -1236,10 +1322,12 @@ def try_connect():
 # - Refresh UI every 20 seconds (uses cache most of the time)
 # - Try to connect every 60 seconds if not connected
 # - Refresh status every 20 seconds (uses cache)
+# - Update chip statuses every 30 seconds (ping check)
 # - Reconnect every 2 hours
 ui.timer(1.0, update_countdowns)  # Update countdowns every second
 ui.timer(10.0, check_schedules)  # Check schedules every 10 seconds to catch trigger times
 ui.timer(20.0, refresh_status)  # Refresh UI every 20 seconds (uses cache)
+ui.timer(30.0, update_chip_statuses)  # Update chip statuses every 30 seconds (ping check)
 ui.timer(60.0, try_connect)  # Try to connect every 60 seconds if not connected
 ui.timer(7200.0, reconnect_controller)  # Reconnect every 2 hours
 
