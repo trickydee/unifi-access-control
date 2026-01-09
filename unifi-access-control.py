@@ -4,6 +4,8 @@ from pyunifi.controller import Controller
 from nicegui import app, ui
 from nicegui.events import ValueChangeEventArguments
 import os
+import subprocess
+import platform
 
 # Logging configuration
 DEBUG_MODE = False  # Set to True for debugging, False for production
@@ -66,7 +68,8 @@ def update_schedule_display(friendly_name):
                 schedule_labels[friendly_name].text = f"📅 Schedule: {unblock_time} - {block_time}"
                 schedule_labels[friendly_name].style('display: block')
             else:
-                schedule_labels[friendly_name].style('display: none')
+                schedule_labels[friendly_name].text = "📅 Schedule Disabled"
+                schedule_labels[friendly_name].style('display: block')
         
         # Update schedule button color
         if friendly_name in schedule_buttons and schedule_buttons[friendly_name]:
@@ -186,6 +189,8 @@ devices_config = load_devices()
 unifi_username = config['unifi_username']
 unifi_password = config['unifi_password']
 unifi_controller = config['unifi_controller']
+# Optional: verification delay in seconds (default 10)
+VERIFICATION_DELAY = config.get('verification_delay', 10)
 
 # Store switch references and temporary access timers
 switches = {}
@@ -268,6 +273,88 @@ def reconnect_controller():
             print(f"Failed to reconnect: {e}")
         c = None
         return False
+
+def ping_device(ip_address, count=2, timeout=2):
+    """
+    Ping a device to check if it's online
+    Returns True if device responds, False otherwise, None on error
+    """
+    if not ip_address:
+        return None  # No IP address configured
+    
+    try:
+        # Determine ping command based on OS
+        if platform.system().lower() == 'windows':
+            cmd = ['ping', '-n', str(count), '-w', str(timeout * 1000), ip_address]
+        else:
+            cmd = ['ping', '-c', str(count), '-W', str(timeout), ip_address]
+        
+        # Run ping command
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout * count + 2
+        )
+        
+        # Check if ping was successful (exit code 0 means success)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception as e:
+        print(f"[VERIFY] Error pinging {ip_address}: {e}")
+        return None
+
+def verify_device_state(friendly_name, expected_blocked):
+    """
+    Verify that a device's actual state matches the expected state by pinging it
+    expected_blocked: True if device should be blocked (offline), False if should be enabled (online)
+    """
+    if friendly_name not in devices_config:
+        return
+    
+    device_info = devices_config[friendly_name]
+    ip_address = device_info.get("ip_address")
+    
+    if not ip_address:
+        debug_log(f"[VERIFY] {friendly_name}: No IP address configured, skipping verification")
+        return
+    
+    # Ping the device
+    is_online = ping_device(ip_address)
+    
+    if is_online is None:
+        print(f"[VERIFY] {friendly_name}: Could not ping {ip_address} (error)")
+        return
+    
+    # Verify state matches expectation
+    # If expected_blocked=True, device should be offline (ping fails)
+    # If expected_blocked=False, device should be online (ping succeeds)
+    state_matches = (is_online == (not expected_blocked))
+    
+    if state_matches:
+        status = "blocked (offline)" if expected_blocked else "enabled (online)"
+        print(f"[VERIFY] ✓ {friendly_name}: Verification passed - device is {status} as expected")
+        add_event_log(friendly_name, 'Verification Passed', f'Device is {"offline" if expected_blocked else "online"} as expected')
+    else:
+        status_expected = "offline" if expected_blocked else "online"
+        status_actual = "online" if is_online else "offline"
+        print(f"[VERIFY] ✗ {friendly_name}: Verification FAILED - expected {status_expected}, but device is {status_actual}")
+        add_event_log(friendly_name, 'Verification Failed', f'Expected {"offline" if expected_blocked else "online"}, but device is {status_actual}')
+
+def add_event_log(device, event_type, details=""):
+    """Add an event to the event log"""
+    global event_log
+    event_log.append({
+        'timestamp': datetime.now(),
+        'device': device,
+        'event': event_type,
+        'details': details
+    })
+    # Keep log size manageable
+    if len(event_log) > 100:
+        event_log.pop(0)  # Remove oldest event
+    save_persistence()  # Save log immediately
 
 def get_blocked(force_refresh=False):
     """Get blocked device status, using cache if available"""
@@ -390,12 +477,7 @@ def turn_on(friendly_name, mac_address, is_manual=True):
         # Programmatic updates are already logged by the schedule/temporary access functions
         if friendly_name not in _programmatic_switch_update:
             event_type = "Enabled (Manual)" if is_manual else "Enabled (Schedule)"
-            event_log.append({
-                'timestamp': datetime.now(),
-                'device': friendly_name,
-                'event': event_type,
-                'details': ''
-            })
+            add_event_log(friendly_name, event_type, '')
         
         # Track manual override if this was a manual action
         if is_manual and friendly_name not in _programmatic_switch_update:
@@ -408,6 +490,12 @@ def turn_on(friendly_name, mac_address, is_manual=True):
                 debug_log(f"[MANUAL] Cleared manual override for {friendly_name} (schedule/temporary access taking control)")
         
         save_persistence()
+        
+        # Schedule verification after delay
+        def verify_after_delay():
+            verify_device_state(friendly_name, expected_blocked=False)
+        ui.timer(VERIFICATION_DELAY, verify_after_delay, once=True)
+        
         return True
     except Exception as e:
         error_str = str(e)
@@ -447,12 +535,7 @@ def turn_off(friendly_name, mac_address, is_manual=True):
         # Programmatic updates are already logged by the schedule/temporary access functions
         if friendly_name not in _programmatic_switch_update:
             event_type = "Disabled (Manual)" if is_manual else "Disabled (Schedule)"
-            event_log.append({
-                'timestamp': datetime.now(),
-                'device': friendly_name,
-                'event': event_type,
-                'details': ''
-            })
+            add_event_log(friendly_name, event_type, '')
         
         # Track manual override if this was a manual action
         if is_manual and friendly_name not in _programmatic_switch_update:
@@ -465,6 +548,12 @@ def turn_off(friendly_name, mac_address, is_manual=True):
                 debug_log(f"[MANUAL] Cleared manual override for {friendly_name} (schedule/temporary access taking control)")
         
         save_persistence()
+        
+        # Schedule verification after delay
+        def verify_after_delay():
+            verify_device_state(friendly_name, expected_blocked=True)
+        ui.timer(VERIFICATION_DELAY, verify_after_delay, once=True)
+        
         return True
     except Exception as e:
         error_str = str(e)
@@ -508,12 +597,7 @@ def turn_on_temporary(friendly_name, mac_address, minutes):
         device_state_history[friendly_name]['last_enabled'] = datetime.now()
         
         # Add to event log
-        event_log.append({
-            'timestamp': datetime.now(),
-            'device': friendly_name,
-            'event': 'Temporary Access Granted',
-            'details': f'{minutes} minutes (expires at {block_time.strftime("%H:%M:%S")})'
-        })
+        add_event_log(friendly_name, 'Temporary Access Granted', f'{minutes} minutes (expires at {block_time.strftime("%H:%M:%S")})')
         
         # Clear manual override when temporary access is granted (temporary access takes priority)
         if friendly_name in manual_overrides:
@@ -619,13 +703,25 @@ def check_schedules():
             continue  # Skip schedule check if temporary access is active
         
         # Get current status - use cached data to avoid rate limiting
-        # Force a refresh only if cache is very stale (older than 30 seconds)
+        # For schedule checks, we need reasonably fresh data, but don't force refresh every time
+        # Check cache age and refresh if stale (older than 60 seconds) to ensure accurate status
         device_map = get_blocked(force_refresh=False)
         device_info = device_map.get(friendly_name)
         if device_info is None:
             print(f"[SCHEDULE] WARNING: {friendly_name} not found in device map, skipping")
             continue
         current_status = device_info.get("blocked", False)
+        
+        # If cache is very stale (older than 60 seconds), try to refresh once
+        # This helps ensure schedule actions are based on current device status
+        global cache_valid_until
+        if cache_valid_until and datetime.now() > cache_valid_until + timedelta(seconds=30):
+            # Cache is more than 30 seconds expired, try a refresh (but don't force if rate limited)
+            if not check_rate_limit():
+                device_map = get_blocked(force_refresh=True)
+                device_info = device_map.get(friendly_name)
+                if device_info:
+                    current_status = device_info.get("blocked", False)
         now_str = now.strftime('%H:%M:%S')
         
         # Handle schedule logic
@@ -662,44 +758,46 @@ def check_schedules():
         has_manual_override = friendly_name in manual_overrides
         manual_override_value = manual_overrides.get(friendly_name)
         
-        # Apply schedule if needed - but respect manual overrides
-        # Manual override persists until schedule actually takes action (opposite of manual state)
+        # Apply schedule if needed
+        # Manual overrides persist until schedule successfully takes action, then they are cleared
         if should_be_blocked and not current_status:
-            # Schedule wants to block, but check manual override
-            # If manual override says enabled, skip blocking - let manual override persist until next block time
+            # Schedule wants to block - attempt action regardless of manual override
+            # If there's a manual override, log it but still attempt the schedule action
             if has_manual_override and manual_override_value is True:
-                print(f"[SCHEDULE] {friendly_name}: Skipping block (manual override: enabled - will stay enabled until next block time)")
+                print(f"[SCHEDULE] {friendly_name}: Blocking (scheduled: {block_time_str} - {unblock_time_str}) - clearing manual override")
             else:
                 print(f"[SCHEDULE] Blocking {friendly_name} (scheduled: {block_time_str} - {unblock_time_str})")
-                # Apply schedule - turn_off will clear the manual override since is_manual=False
-                if turn_off(friendly_name, mac, is_manual=False):
-                    if friendly_name in switches:
-                        # Mark as programmatic update to prevent switch handler from logging duplicate event
-                        _programmatic_switch_update.add(friendly_name)
-                        switches[friendly_name].value = False
-                        # Remove from programmatic set after a short delay
-                        def clear_programmatic_flag():
-                            _programmatic_switch_update.discard(friendly_name)
-                        ui.timer(0.1, clear_programmatic_flag, once=True)
+            # Apply schedule - turn_off will clear the manual override since is_manual=False
+            if turn_off(friendly_name, mac, is_manual=False):
+                if friendly_name in switches:
+                    # Mark as programmatic update to prevent switch handler from logging duplicate event
+                    _programmatic_switch_update.add(friendly_name)
+                    switches[friendly_name].value = False
+                    # Remove from programmatic set after a short delay
+                    def clear_programmatic_flag():
+                        _programmatic_switch_update.discard(friendly_name)
+                    ui.timer(0.1, clear_programmatic_flag, once=True)
+            else:
+                print(f"[SCHEDULE] ERROR: Failed to block {friendly_name} (manual override will persist until next successful schedule action)")
         elif not should_be_blocked and current_status:
-            # Schedule wants to unblock, but check manual override
-            # If manual override says disabled, skip unblocking - let manual override persist until next unblock time
+            # Schedule wants to unblock - attempt action regardless of manual override
+            # If there's a manual override, log it but still attempt the schedule action
             if has_manual_override and manual_override_value is False:
-                print(f"[SCHEDULE] {friendly_name}: Skipping unblock (manual override: disabled - will stay disabled until next unblock time)")
+                print(f"[SCHEDULE] {friendly_name}: Unblocking (scheduled: {block_time_str} - {unblock_time_str}) - clearing manual override")
             else:
                 print(f"[SCHEDULE] Unblocking {friendly_name} (scheduled: {block_time_str} - {unblock_time_str})")
-                # Apply schedule - turn_on will clear the manual override since is_manual=False
-                if turn_on(friendly_name, mac, is_manual=False):
-                    if friendly_name in switches:
-                        # Mark as programmatic update to prevent switch handler from logging duplicate event
-                        _programmatic_switch_update.add(friendly_name)
-                        switches[friendly_name].value = True
-                        # Remove from programmatic set after a short delay
-                        def clear_programmatic_flag():
-                            _programmatic_switch_update.discard(friendly_name)
-                        ui.timer(0.1, clear_programmatic_flag, once=True)
-                else:
-                    print(f"[SCHEDULE] ERROR: Failed to unblock {friendly_name}")
+            # Apply schedule - turn_on will clear the manual override since is_manual=False
+            if turn_on(friendly_name, mac, is_manual=False):
+                if friendly_name in switches:
+                    # Mark as programmatic update to prevent switch handler from logging duplicate event
+                    _programmatic_switch_update.add(friendly_name)
+                    switches[friendly_name].value = True
+                    # Remove from programmatic set after a short delay
+                    def clear_programmatic_flag():
+                        _programmatic_switch_update.discard(friendly_name)
+                    ui.timer(0.1, clear_programmatic_flag, once=True)
+            else:
+                print(f"[SCHEDULE] ERROR: Failed to unblock {friendly_name} (manual override will persist until next successful schedule action)")
         elif not should_be_blocked and not current_status:
             # Device should be unblocked and already is - this is fine, just log for debugging
             debug_log(f"[SCHEDULE] {friendly_name}: Already unblocked (as scheduled)")
@@ -937,7 +1035,7 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
                 if friendly_name not in temporary_access:
                     countdown_label.style('display: none')
                 
-                # Show schedule status if enabled (create label and store reference)
+                # Show schedule status (create label and store reference)
                 schedule = devices_config.get(friendly_name, {}).get("schedule", {})
                 schedule_label = ui.label('').classes('text-xs text-gray-500')
                 schedule_labels[friendly_name] = schedule_label  # Store reference for updates
@@ -947,7 +1045,8 @@ with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'
                     schedule_label.text = f"📅 Schedule: {unblock_time} - {block_time}"
                     schedule_label.style('display: block')
                 else:
-                    schedule_label.style('display: none')
+                    schedule_label.text = "📅 Schedule Disabled"
+                    schedule_label.style('display: block')
                 
                 # Show last enabled/disabled times (create labels that will be updated dynamically)
                 enabled_label = ui.label('').classes('text-xs text-green-500')
@@ -978,12 +1077,7 @@ def update_countdowns():
             mac = devices_config[friendly_name]["mac"]
             print(f"Temporary access expired for {friendly_name}, blocking...")
             # Add to event log before blocking
-            event_log.append({
-                'timestamp': datetime.now(),
-                'device': friendly_name,
-                'event': 'Temporary Access Expired',
-                'details': 'Auto-blocked after temporary access period ended'
-            })
+            add_event_log(friendly_name, 'Temporary Access Expired', 'Auto-blocked after temporary access period ended')
             turn_off(friendly_name, mac, is_manual=False)
             del temporary_access[friendly_name]
             save_persistence()
@@ -1112,14 +1206,23 @@ def refresh_status():
                                 countdown_labels[name].style('display: block !important')
                 else:
                     # Only update switch if no temporary access is active
-                    new_value = not info["blocked"]
-                    if switches[name].value != new_value:
-                        switches[name].value = new_value
+                    # BUT: Respect manual overrides - don't override switch if user manually set it
+                    if name in manual_overrides:
+                        # Manual override is set - respect it and don't update switch from controller state
+                        manual_override_value = manual_overrides[name]
+                        if switches[name].value != manual_override_value:
+                            # Switch doesn't match manual override - update it to match
+                            switches[name].value = manual_override_value
+                    else:
+                        # No manual override - sync switch with controller state
+                        new_value = not info["blocked"]
+                        if switches[name].value != new_value:
+                            switches[name].value = new_value
 
 # Check temporary access - now handled in update_countdowns() every second
 def check_timers():
     # check_temporary_access() is now called in update_countdowns() every second
-    check_schedules()
+    check_schedules()  # Check schedules more frequently to catch trigger times
     refresh_status()
 
 # Try to connect periodically if not connected (but respect rate limits)
@@ -1127,16 +1230,17 @@ def try_connect():
     if c is None and not check_rate_limit():
         ensure_controller()
 
-# Reduced frequency to avoid rate limits:
-# - Refresh UI every 20 seconds (was 10) - uses cache most of the time
+# Timer frequencies optimized for rate limiting:
 # - Update countdowns every second for real-time display
-# - Try to connect every 60 seconds if not connected (was 30)
-# - Check timers and schedules every 2 minutes (was 1 minute)
-# - Reconnect every 2 hours (was 1 hour)
+# - Check schedules every 10 seconds to catch trigger times (schedules don't make API calls, just check time)
+# - Refresh UI every 20 seconds (uses cache most of the time)
+# - Try to connect every 60 seconds if not connected
+# - Refresh status every 20 seconds (uses cache)
+# - Reconnect every 2 hours
 ui.timer(1.0, update_countdowns)  # Update countdowns every second
+ui.timer(10.0, check_schedules)  # Check schedules every 10 seconds to catch trigger times
 ui.timer(20.0, refresh_status)  # Refresh UI every 20 seconds (uses cache)
 ui.timer(60.0, try_connect)  # Try to connect every 60 seconds if not connected
-ui.timer(120.0, check_timers)  # Check timers and schedules every 2 minutes
 ui.timer(7200.0, reconnect_controller)  # Reconnect every 2 hours
 
 ui.run(dark=True, port=8080)

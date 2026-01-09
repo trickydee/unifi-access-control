@@ -8,7 +8,8 @@ A web-based control panel for managing device access on a Ubiquiti UniFi network
 - **Scheduled Access**: Configure automatic blocking/unblocking times for each device
 - **Temporary Access**: Grant devices temporary access for a specified number of minutes with a countdown timer
 - **Manual Override Persistence**: Manual toggles persist until the next scheduled event or temporary access expires
-- **Event Log**: View a scrollable history of all enable/disable events, including temporary access grants
+- **Ping Verification**: Automatically verify block/enable actions by pinging devices (optional IP address required)
+- **Event Log**: View a scrollable history of all enable/disable events, including temporary access grants and verification results
 - **Real-time Status**: See connection status, countdown timers, and last enabled/disabled times
 - **Mobile-Friendly UI**: Responsive design optimized for mobile devices
 - **Persistence**: All state (temporary access, device history, manual overrides, event log) persists across app restarts
@@ -59,7 +60,8 @@ Create `config.json` in the project root with the following format:
 {
   "unifi_username": "your_username",
   "unifi_password": "your_password",
-  "unifi_controller": "192.168.0.5"
+  "unifi_controller": "192.168.0.5",
+  "verification_delay": 10
 }
 ```
 
@@ -67,6 +69,7 @@ Create `config.json` in the project root with the following format:
 - `unifi_username`: Username for your UniFi controller
 - `unifi_password`: Password for your UniFi controller
 - `unifi_controller`: IP address or hostname of your UniFi controller
+- `verification_delay` (optional): Seconds to wait after block/enable before ping verification (default: 10)
 
 ### devices.json
 
@@ -77,6 +80,7 @@ This file defines the devices you want to manage, their MAC addresses, and optio
 {
   "Device Friendly Name": {
     "mac": "aa:bb:cc:dd:ee:ff",
+    "ip_address": "192.168.1.100",
     "schedule": {
       "enabled": true,
       "block_time": "22:00",
@@ -89,6 +93,7 @@ This file defines the devices you want to manage, their MAC addresses, and optio
 **Fields:**
 - `Device Friendly Name`: A descriptive name for the device (e.g., "Bobs PC", "Freds Laptop", "Sallys MacBook")
 - `mac`: The MAC address of the device in `aa:bb:cc:dd:ee:ff` format
+- `ip_address` (optional): IP address of the device for ping verification (e.g., "192.168.1.100")
 - `schedule` (optional): Schedule configuration object
   - `enabled`: Boolean - whether the schedule is active
   - `block_time`: Time string in `HH:MM` format (24-hour) when the device should be blocked
@@ -107,6 +112,7 @@ This file defines the devices you want to manage, their MAC addresses, and optio
 {
   "Bobs PC": {
     "mac": "aa:bb:cc:dd:ee:ff",
+    "ip_address": "192.168.1.100",
     "schedule": {
       "enabled": true,
       "block_time": "22:00",
@@ -115,12 +121,14 @@ This file defines the devices you want to manage, their MAC addresses, and optio
   },
   "Freds Laptop": {
     "mac": "11:22:33:44:55:66",
+    "ip_address": "192.168.1.101",
     "schedule": {
       "enabled": false
     }
   },
   "Sallys MacBook": {
     "mac": "aa:11:bb:22:cc:33",
+    "ip_address": "192.168.1.102",
     "schedule": {
       "enabled": true,
       "block_time": "23:00",
@@ -200,7 +208,42 @@ A countdown timer will display showing when the device will be blocked again. Th
    - Orange: Temporary access events
 4. Click "🗑️ Clear Log" to clear all events
 
+### Ping Verification
+
+The application can automatically verify that block/enable actions were successful by pinging devices:
+
+1. **Configure IP addresses**: Add an `ip_address` field to each device in `devices.json`
+2. **Configure delay**: Set `verification_delay` in `config.json` (default: 10 seconds)
+3. **Automatic verification**: After each block/enable action, the app will:
+   - Wait for the configured delay (default 10 seconds)
+   - Ping the device to check if it's online or offline
+   - Verify the state matches the expected state (blocked = offline, enabled = online)
+   - Log verification results to the event log
+
+**Verification Results:**
+- ✓ **Verification Passed**: Device state matches expectation (blocked devices are offline, enabled devices are online)
+- ✗ **Verification Failed**: Device state doesn't match (e.g., device is still online after being blocked)
+
+**Note**: If no IP address is configured for a device, verification is skipped (logged at debug level only).
+
 ## Features in Detail
+
+### Ping Verification
+
+The application includes automatic ping verification to ensure block/enable actions were successful:
+
+- **How it works**: After a device is blocked or enabled, the app waits for a configurable delay (default 10 seconds), then pings the device's IP address
+- **Verification logic**:
+  - When a device is **blocked**, it should be **offline** (ping fails)
+  - When a device is **enabled**, it should be **online** (ping succeeds)
+- **Results**: Verification results are logged to the event log:
+  - ✓ Verification Passed: Device state matches expectation
+  - ✗ Verification Failed: Device state doesn't match (indicates the UniFi API action may not have worked)
+- **Configuration**: 
+  - Add `ip_address` field to devices in `devices.json` (optional)
+  - Set `verification_delay` in `config.json` (optional, default: 10 seconds)
+- **Cross-platform**: Works on Windows, Linux, and macOS
+- **Graceful handling**: If no IP address is configured, verification is skipped (no error)
 
 ### Manual Override Persistence
 
