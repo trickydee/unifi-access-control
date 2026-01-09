@@ -983,7 +983,7 @@ def make_schedule_handler(friendly_name):
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
     with ui.row().classes('w-full items-center justify-center gap-4 mb-4'):
-        ui.label('Home Network - Control Panel v4.0.4').classes('text-2xl text-center')
+        ui.label('Home Network - Control Panel v4.0.5').classes('text-2xl text-center')
         ui.button('📋 Event Log', on_click=lambda: show_event_log()).classes('bg-gray-600 text-white')
     
     # Connection status indicator
