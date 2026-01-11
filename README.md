@@ -289,11 +289,74 @@ If you see "Rate limited" messages:
 - Ensure the device has a valid MAC address in `devices.json`
 - Check the event log to see if schedule events are being logged
 
+## Running the Application
+
+### Local Development
+
+**Basic run:**
+```bash
+python unifi-access-control.py
+```
+
+**With debug logging:**
+```bash
+DEBUG_MODE=true python unifi-access-control.py
+```
+
+**Using restart script (macOS/Linux):**
+```bash
+./restart-local.sh
+```
+
+This script will:
+- Stop any running instances
+- Enable debug mode
+- Start the app with logging to `/tmp/unifi-app.log`
+- Show you how to view the logs
+
+**View logs:**
+```bash
+tail -f /tmp/unifi-app.log
+```
+
+### Production Deployment
+
+For production deployment, use the provided systemd service file:
+
+1. **Edit `unifi-access-control.service`:**
+   - Replace `YOUR_USERNAME` with your system username
+   - Replace `/path/to/unifi-access-control` with your actual path
+
+2. **Install the service:**
+   ```bash
+   sudo cp unifi-access-control.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable unifi-access-control.service
+   sudo systemctl start unifi-access-control.service
+   ```
+
+3. **Manage the service:**
+   ```bash
+   sudo systemctl status unifi-access-control.service
+   sudo systemctl restart unifi-access-control.service
+   sudo journalctl -u unifi-access-control.service -f
+   ```
+
+See `SYSTEMD_SETUP.md` for detailed production deployment instructions.
+
 ## Development
 
 ### Debug Mode
 
-Set `DEBUG_MODE = True` in `unifi-access-control.py` to enable verbose logging for debugging.
+Debug mode can be enabled via environment variable:
+```bash
+DEBUG_MODE=true python unifi-access-control.py
+```
+
+Or set in `unifi-access-control.py`:
+```python
+DEBUG_MODE = True
+```
 
 ### Port Configuration
 
@@ -303,13 +366,27 @@ The application runs on port 8080 by default. To change this, modify the `ui.run
 ui.run(dark=True, port=8080)
 ```
 
+### Development Setup
+
+For detailed development setup instructions, see `docs/DEVELOPMENT_SETUP.md`.
+
+For technical specifications and architecture details, see `docs/TECHNICAL_SPEC.md`.
+
 ## License
 
 This project is provided as-is for personal use.
 
 ## Version
 
-Current version: **v4.0.4**
+Current version: **v4.0.7**
+
+## Documentation
+
+Additional documentation is available in the `docs/` folder:
+
+- **`DEVELOPMENT_SETUP.md`**: Step-by-step guide for setting up the application on a new instance
+- **`TECHNICAL_SPEC.md`**: Technical specification, architecture, and implementation details
+- **`SYSTEMD_SETUP.md`**: Production deployment with systemd
 
 ## Contributing
 

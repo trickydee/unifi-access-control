@@ -1,0 +1,23 @@
+[Unit]
+Description=UniFi Access Control Application
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/unifi-access-control
+Environment="PATH=/path/to/unifi-access-control/venv/bin"
+Environment="DEBUG_MODE=true"
+ExecStart=/path/to/unifi-access-control/venv/bin/python /path/to/unifi-access-control/unifi-access-control.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/unifi-access-control/app.log
+StandardError=append:/var/log/unifi-access-control/error.log
+
+# Security settings (optional but recommended)
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

@@ -6,9 +6,12 @@ from nicegui.events import ValueChangeEventArguments
 import os
 import subprocess
 import platform
+import threading
+import time
 
 # Logging configuration
-DEBUG_MODE = False  # Set to True for debugging, False for production
+# Can be set via environment variable DEBUG_MODE=true
+DEBUG_MODE = os.environ.get('DEBUG_MODE', 'false').lower() == 'true'
 
 def debug_log(message):
     """Only log if DEBUG_MODE is enabled"""
@@ -191,6 +194,12 @@ unifi_password = config['unifi_password']
 unifi_controller = config['unifi_controller']
 # Optional: verification delay in seconds (default 10)
 VERIFICATION_DELAY = config.get('verification_delay', 10)
+# Optional: number of pings to perform during verification (default 5)
+RECOVERY_PING_COUNT = config.get('recovery_ping_count', 5)
+
+# Track consecutive ping failures for recovery mechanism
+# Only tracks failures when device should be online but is offline
+ping_failure_count = {}  # Device name -> consecutive failure count
 
 # Store switch references and temporary access timers
 switches = {}
@@ -212,6 +221,39 @@ load_persistence()  # Load persisted state on startup (after variables are initi
 
 # Initialize controller as None - will be created lazily
 c = None
+
+# Global flag to control background thread
+_schedule_thread_running = True
+_schedule_thread_lock = threading.Lock()
+
+def background_schedule_checker():
+    """Background thread that checks schedules independently of browser connections"""
+    global _schedule_thread_running, devices_config
+    while _schedule_thread_running:
+        try:
+            # Reload devices.json periodically to pick up changes from other UI instances
+            try:
+                with _schedule_thread_lock:
+                    new_devices_config = load_devices()
+                    # Only update if file has actually changed (simple check)
+                    if new_devices_config != devices_config:
+                        devices_config = new_devices_config
+                        print(f"[SCHEDULE] Reloaded devices.json - detected changes")
+            except Exception as e:
+                print(f"[SCHEDULE] Error reloading devices.json: {e}")
+            
+            # Check schedules
+            check_schedules()
+        except Exception as e:
+            print(f"[SCHEDULE] Error in background schedule checker: {e}")
+        
+        # Sleep for 10 seconds before next check
+        time.sleep(10)
+
+# Start background thread for schedule checks (runs independently of browser connections)
+schedule_thread = threading.Thread(target=background_schedule_checker, daemon=True)
+schedule_thread.start()
+print("[SCHEDULE] Background schedule checker thread started")
 
 # Rate limiting and caching
 last_api_call = None
@@ -311,6 +353,8 @@ def verify_device_state(friendly_name, expected_blocked):
     Verify that a device's actual state matches the expected state by pinging it
     expected_blocked: True if device should be blocked (offline), False if should be enabled (online)
     """
+    global ping_failure_count
+    
     if friendly_name not in devices_config:
         return
     
@@ -321,12 +365,27 @@ def verify_device_state(friendly_name, expected_blocked):
         debug_log(f"[VERIFY] {friendly_name}: No IP address configured, skipping verification")
         return
     
-    # Ping the device
-    is_online = ping_device(ip_address)
+    # Ping the device multiple times to check responsiveness (configurable)
+    ping_results = []
+    for i in range(RECOVERY_PING_COUNT):
+        is_online = ping_device(ip_address, count=1, timeout=2)
+        ping_results.append(is_online)
+        if i < RECOVERY_PING_COUNT - 1:  # Don't sleep after last ping
+            time.sleep(1)  # 1 second between pings
     
-    if is_online is None:
-        print(f"[VERIFY] {friendly_name}: Could not ping {ip_address} (error)")
+    # Count successful pings (True values, ignoring None/errors)
+    successful_pings = sum(1 for result in ping_results if result is True)
+    failed_pings = sum(1 for result in ping_results if result is False)
+    
+    # Determine if device is online based on ping results
+    # Device is considered online if at least 1 ping succeeds (device is responsive)
+    # Device is considered offline if all pings fail
+    if successful_pings == 0 and failed_pings == 0:
+        # All pings returned None (errors) - can't determine status
+        print(f"[VERIFY] {friendly_name}: Could not ping {ip_address} (error on all attempts)")
         return
+    
+    is_online = successful_pings > 0
     
     # Verify state matches expectation
     # If expected_blocked=True, device should be offline (ping fails)
@@ -334,14 +393,79 @@ def verify_device_state(friendly_name, expected_blocked):
     state_matches = (is_online == (not expected_blocked))
     
     if state_matches:
+        # Verification passed - reset failure counter
+        if friendly_name in ping_failure_count:
+            del ping_failure_count[friendly_name]
         status = "blocked (offline)" if expected_blocked else "enabled (online)"
-        print(f"[VERIFY] ✓ {friendly_name}: Verification passed - device is {status} as expected")
-        add_event_log(friendly_name, 'Verification Passed', f'Device is {"offline" if expected_blocked else "online"} as expected')
+        print(f"[VERIFY] ✓ {friendly_name}: Verification passed - device is {status} as expected ({successful_pings}/{RECOVERY_PING_COUNT} pings successful)")
+        add_event_log(friendly_name, 'Verification Passed', f'Device is {"offline" if expected_blocked else "online"} as expected ({successful_pings}/{RECOVERY_PING_COUNT} pings successful)')
     else:
         status_expected = "offline" if expected_blocked else "online"
         status_actual = "online" if is_online else "offline"
-        print(f"[VERIFY] ✗ {friendly_name}: Verification FAILED - expected {status_expected}, but device is {status_actual}")
-        add_event_log(friendly_name, 'Verification Failed', f'Expected {"offline" if expected_blocked else "online"}, but device is {status_actual}')
+        print(f"[VERIFY] ✗ {friendly_name}: Verification FAILED - expected {status_expected}, but device is {status_actual} ({successful_pings}/{RECOVERY_PING_COUNT} pings successful, {failed_pings}/{RECOVERY_PING_COUNT} failed)")
+        
+        # Only track failures when device should be online but is offline
+        if not expected_blocked and not is_online:
+            # Device should be online but is offline
+            # If all pings failed in this verification check, trigger recovery immediately
+            if failed_pings >= RECOVERY_PING_COUNT:
+                # All pings failed - device is completely unresponsive, trigger recovery
+                print(f"[VERIFY] {friendly_name}: Device unresponsive after {RECOVERY_PING_COUNT} pings (all failed) - triggering recovery (disable/enable cycle)")
+                add_event_log(friendly_name, 'Verification Failed', f'Device unresponsive after {RECOVERY_PING_COUNT} pings (all {failed_pings}/{RECOVERY_PING_COUNT} pings failed) - triggering recovery')
+                
+                # Trigger recovery: disable then enable
+                mac_address = device_info.get("mac")
+                if mac_address:
+                    # First, disable the device
+                    print(f"[RECOVERY] {friendly_name}: Disabling device for recovery...")
+                    if turn_off(friendly_name, mac_address, is_manual=False):
+                        # Schedule enable after 5 seconds
+                        def recovery_enable():
+                            print(f"[RECOVERY] {friendly_name}: Re-enabling device after recovery disable...")
+                            if turn_on(friendly_name, mac_address, is_manual=False):
+                                # Reset failure counter after recovery cycle completes successfully
+                                if friendly_name in ping_failure_count:
+                                    del ping_failure_count[friendly_name]
+                                    print(f"[RECOVERY] {friendly_name}: Reset ping failure counter after successful recovery")
+                                
+                                add_event_log(friendly_name, 'Resent Enable as device unresponsive', f'Device was unresponsive after {RECOVERY_PING_COUNT} pings - recovery cycle completed')
+                                print(f"[RECOVERY] {friendly_name}: Recovery cycle completed - device re-enabled")
+                                # Schedule another verification after delay to check if recovery worked
+                                def verify_after_recovery():
+                                    verify_device_state(friendly_name, expected_blocked=False)
+                                try:
+                                    ui.timer(VERIFICATION_DELAY + 5, verify_after_recovery, once=True)
+                                except:
+                                    timer = threading.Timer(VERIFICATION_DELAY + 5, verify_after_recovery)
+                                    timer.daemon = True
+                                    timer.start()
+                            else:
+                                print(f"[RECOVERY] {friendly_name}: Failed to re-enable device after recovery")
+                                add_event_log(friendly_name, 'Recovery Failed', 'Failed to re-enable device after recovery disable')
+                                # Keep failure counter since recovery failed
+                        
+                        try:
+                            ui.timer(5.0, recovery_enable, once=True)
+                        except:
+                            timer = threading.Timer(5.0, recovery_enable)
+                            timer.daemon = True
+                            timer.start()
+                    else:
+                        print(f"[RECOVERY] {friendly_name}: Failed to disable device for recovery")
+                        add_event_log(friendly_name, 'Recovery Failed', 'Failed to disable device for recovery')
+                else:
+                    print(f"[RECOVERY] {friendly_name}: Cannot trigger recovery - MAC address not found")
+            else:
+                # Some pings failed but not all - just log the failure
+                # Track consecutive failures for monitoring
+                ping_failure_count[friendly_name] = ping_failure_count.get(friendly_name, 0) + 1
+                failure_count = ping_failure_count[friendly_name]
+                add_event_log(friendly_name, 'Verification Failed', f'Expected {status_expected}, but device is {status_actual} ({failed_pings}/{RECOVERY_PING_COUNT} pings failed, {failure_count} consecutive verification failures)')
+        else:
+            # Other type of verification failure (should be offline but is online) - reset counter
+            if friendly_name in ping_failure_count:
+                del ping_failure_count[friendly_name]
+            add_event_log(friendly_name, 'Verification Failed', f'Expected {status_expected}, but device is {status_actual} ({successful_pings}/{RECOVERY_PING_COUNT} pings successful)')
 
 def add_event_log(device, event_type, details=""):
     """Add an event to the event log"""
@@ -438,8 +562,8 @@ def get_blocked(force_refresh=False):
         if cached_device_status:
             return cached_device_status
         # Otherwise return default state on error
-        return {
-            name: {
+    return {
+        name: {
                 "mac": info["mac"],
                 "blocked": False
             }
@@ -493,9 +617,17 @@ def turn_on(friendly_name, mac_address, is_manual=True):
         save_persistence()
         
         # Schedule verification after delay
+        # Use threading.Timer for background thread safety, ui.timer for UI thread
         def verify_after_delay():
             verify_device_state(friendly_name, expected_blocked=False)
-        ui.timer(VERIFICATION_DELAY, verify_after_delay, once=True)
+        try:
+            # Try ui.timer first (works in UI context)
+            ui.timer(VERIFICATION_DELAY, verify_after_delay, once=True)
+        except:
+            # Fallback to threading.Timer if ui.timer doesn't work (e.g., from background thread)
+            timer = threading.Timer(VERIFICATION_DELAY, verify_after_delay)
+            timer.daemon = True
+            timer.start()
         
         return True
     except Exception as e:
@@ -517,20 +649,32 @@ def turn_off(friendly_name, mac_address, is_manual=True):
         print(f"Failed to block {friendly_name}: Controller not available")
         return False
     try:
+        # Check current device status BEFORE blocking to determine if we're actually changing state
+        if friendly_name not in device_state_history:
+            device_state_history[friendly_name] = {}
+        
+        # Get current device status from cache to check if it's already blocked
+        device_map = get_blocked(force_refresh=False)
+        device_info = device_map.get(friendly_name)
+        was_already_blocked = device_info.get("blocked", False) if device_info else False
+        
         debug_log(f"Blocking {friendly_name}...")
         c.block_client(mac_address)
         # Clear cache to force refresh on next call
         cached_device_status = None
         cache_valid_until = None
+        
         # Clear any temporary access timer if manually blocked
         if friendly_name in temporary_access:
             debug_log(f"[DEBUG] turn_off: DELETING {friendly_name} from temporary_access (device was manually blocked)")
             del temporary_access[friendly_name]
             debug_log(f"[DEBUG] turn_off: temporary_access now has {len(temporary_access)} entries: {list(temporary_access.keys())}")
-        # Record disable time
-        if friendly_name not in device_state_history:
-            device_state_history[friendly_name] = {}
-        device_state_history[friendly_name]['last_disabled'] = datetime.now()
+        
+        # Only update last_disabled if device was NOT already blocked (we're transitioning from enabled to disabled)
+        # OR if we don't have a last_disabled time yet (first time disabling this device)
+        if not was_already_blocked or 'last_disabled' not in device_state_history[friendly_name] or not device_state_history[friendly_name]['last_disabled']:
+            device_state_history[friendly_name]['last_disabled'] = datetime.now()
+        # Otherwise, preserve the existing last_disabled time (device was already disabled, we're just re-applying the block)
         
         # Add to event log (only if not a programmatic update from schedule/temporary access)
         # Programmatic updates are already logged by the schedule/temporary access functions
@@ -551,9 +695,17 @@ def turn_off(friendly_name, mac_address, is_manual=True):
         save_persistence()
         
         # Schedule verification after delay
+        # Use threading.Timer for background thread safety, ui.timer for UI thread
         def verify_after_delay():
             verify_device_state(friendly_name, expected_blocked=True)
-        ui.timer(VERIFICATION_DELAY, verify_after_delay, once=True)
+        try:
+            # Try ui.timer first (works in UI context)
+            ui.timer(VERIFICATION_DELAY, verify_after_delay, once=True)
+        except:
+            # Fallback to threading.Timer if ui.timer doesn't work (e.g., from background thread)
+            timer = threading.Timer(VERIFICATION_DELAY, verify_after_delay)
+            timer.daemon = True
+            timer.start()
         
         return True
     except Exception as e:
@@ -677,6 +829,7 @@ def parse_time(time_str):
 
 def check_schedules():
     """Check and apply scheduled block/unblock times - called every second"""
+    global devices_config
     now = datetime.now().time()
     
     for friendly_name, info in devices_config.items():
@@ -777,7 +930,14 @@ def check_schedules():
                     # Remove from programmatic set after a short delay
                     def clear_programmatic_flag():
                         _programmatic_switch_update.discard(friendly_name)
-                    ui.timer(0.1, clear_programmatic_flag, once=True)
+                    try:
+                        # Try ui.timer first (works in UI context)
+                        ui.timer(0.1, clear_programmatic_flag, once=True)
+                    except:
+                        # Fallback to threading.Timer if ui.timer doesn't work (e.g., from background thread)
+                        timer = threading.Timer(0.1, clear_programmatic_flag)
+                        timer.daemon = True
+                        timer.start()
             else:
                 print(f"[SCHEDULE] ERROR: Failed to block {friendly_name} (manual override will persist until next successful schedule action)")
         elif not should_be_blocked and current_status:
@@ -796,7 +956,14 @@ def check_schedules():
                     # Remove from programmatic set after a short delay
                     def clear_programmatic_flag():
                         _programmatic_switch_update.discard(friendly_name)
-                    ui.timer(0.1, clear_programmatic_flag, once=True)
+                    try:
+                        # Try ui.timer first (works in UI context)
+                        ui.timer(0.1, clear_programmatic_flag, once=True)
+                    except:
+                        # Fallback to threading.Timer if ui.timer doesn't work (e.g., from background thread)
+                        timer = threading.Timer(0.1, clear_programmatic_flag)
+                        timer.daemon = True
+                        timer.start()
             else:
                 print(f"[SCHEDULE] ERROR: Failed to unblock {friendly_name} (manual override will persist until next successful schedule action)")
         elif not should_be_blocked and not current_status:
@@ -1049,7 +1216,7 @@ def update_chip_statuses():
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
     with ui.row().classes('w-full items-center justify-center gap-4 mb-4'):
-        ui.label('Home Network - Control Panel v4.0.6').classes('text-2xl text-center')
+        ui.label('Home Network - Control Panel v4.0.7').classes('text-2xl text-center')
         ui.button('📋 Event Log', on_click=lambda: show_event_log()).classes('bg-gray-600 text-white')
     
     # Connection status indicator
@@ -1233,7 +1400,15 @@ def update_countdowns():
         if friendly_name in enabled_labels and enabled_labels[friendly_name]:
             if history.get('last_enabled'):
                 enabled_time = history['last_enabled']
-                time_str = enabled_time.strftime('%H:%M:%S')
+                # Format with date and time to show when device was actually enabled
+                # Use date if enabled time is from a different day, otherwise just show time
+                now = datetime.now()
+                if enabled_time.date() == now.date():
+                    # Same day - just show time
+                    time_str = enabled_time.strftime('%H:%M:%S')
+                else:
+                    # Different day - show date and time
+                    time_str = enabled_time.strftime('%Y-%m-%d %H:%M:%S')
                 enabled_labels[friendly_name].text = f"✅ Enabled: {time_str}"
                 enabled_labels[friendly_name].style('display: block')
             else:
@@ -1243,7 +1418,15 @@ def update_countdowns():
         if friendly_name in disabled_labels and disabled_labels[friendly_name]:
             if history.get('last_disabled'):
                 disabled_time = history['last_disabled']
-                time_str = disabled_time.strftime('%H:%M:%S')
+                # Format with date and time to show when device was actually disabled
+                # Use date if disabled time is from a different day, otherwise just show time
+                now = datetime.now()
+                if disabled_time.date() == now.date():
+                    # Same day - just show time
+                    time_str = disabled_time.strftime('%H:%M:%S')
+                else:
+                    # Different day - show date and time
+                    time_str = disabled_time.strftime('%Y-%m-%d %H:%M:%S')
                 disabled_labels[friendly_name].text = f"❌ Disabled: {time_str}"
                 disabled_labels[friendly_name].style('display: block')
             else:
@@ -1276,8 +1459,8 @@ def refresh_status():
     # BUT: Don't override switch value if device has temporary access (countdown is active)
     if not check_rate_limit():
         device_map = get_blocked()  # This will use cache if available
-        for name, info in device_map.items():
-            if name in switches:
+    for name, info in device_map.items():
+        if name in switches:
                 # If device has temporary access, ALWAYS keep switch enabled and countdown visible
                 if name in temporary_access:
                     # Force switch to enabled when temporary access is active
@@ -1318,16 +1501,32 @@ def try_connect():
 
 # Timer frequencies optimized for rate limiting:
 # - Update countdowns every second for real-time display
-# - Check schedules every 10 seconds to catch trigger times (schedules don't make API calls, just check time)
+# - Schedules are checked by background thread every 10 seconds (independent of browser connections)
 # - Refresh UI every 20 seconds (uses cache most of the time)
+# - Reload devices.json every 30 seconds to sync changes across browser tabs
 # - Try to connect every 60 seconds if not connected
-# - Refresh status every 20 seconds (uses cache)
 # - Update chip statuses every 30 seconds (ping check)
 # - Reconnect every 2 hours
 ui.timer(1.0, update_countdowns)  # Update countdowns every second
-ui.timer(10.0, check_schedules)  # Check schedules every 10 seconds to catch trigger times
 ui.timer(20.0, refresh_status)  # Refresh UI every 20 seconds (uses cache)
 ui.timer(30.0, update_chip_statuses)  # Update chip statuses every 30 seconds (ping check)
+
+def reload_devices_for_ui():
+    """Reload devices.json to sync changes across browser tabs"""
+    global devices_config
+    try:
+        with _schedule_thread_lock:
+            new_devices_config = load_devices()
+            if new_devices_config != devices_config:
+                devices_config = new_devices_config
+                # Update schedule displays in UI
+                for friendly_name in schedule_labels.keys():
+                    update_schedule_display(friendly_name)
+                print(f"[UI] Reloaded devices.json - schedule displays updated")
+    except Exception as e:
+        debug_log(f"[UI] Error reloading devices.json: {e}")
+
+ui.timer(30.0, reload_devices_for_ui)  # Reload devices.json every 30 seconds to sync across browser tabs
 ui.timer(60.0, try_connect)  # Try to connect every 60 seconds if not connected
 ui.timer(7200.0, reconnect_controller)  # Reconnect every 2 hours
 
