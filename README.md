@@ -378,7 +378,7 @@ This project is provided as-is for personal use.
 
 ## Version
 
-Current version: **v4.0.7**
+Current version: **v4.0.8**
 
 ## Documentation
 

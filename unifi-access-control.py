@@ -8,6 +8,7 @@ import subprocess
 import platform
 import threading
 import time
+import shutil
 
 # Logging configuration
 # Can be set via environment variable DEBUG_MODE=true
@@ -317,6 +318,25 @@ def reconnect_controller():
         c = None
         return False
 
+def _find_ping_command():
+    """
+    Find the ping command path
+    Returns the full path to ping, or 'ping' as fallback
+    """
+    # Try to find ping using shutil.which (respects PATH)
+    ping_path = shutil.which('ping')
+    if ping_path:
+        return ping_path
+    
+    # If not in PATH, try common locations (for systemd services with minimal PATH)
+    common_paths = ['/usr/bin/ping', '/bin/ping', '/sbin/ping']
+    for path in common_paths:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    
+    # Fallback to 'ping' (may fail, but at least we tried)
+    return 'ping'
+
 def ping_device(ip_address, count=2, timeout=2):
     """
     Ping a device to check if it's online
@@ -326,11 +346,14 @@ def ping_device(ip_address, count=2, timeout=2):
         return None  # No IP address configured
     
     try:
+        # Find ping command (handles PATH issues in systemd)
+        ping_cmd = _find_ping_command()
+        
         # Determine ping command based on OS
         if platform.system().lower() == 'windows':
-            cmd = ['ping', '-n', str(count), '-w', str(timeout * 1000), ip_address]
+            cmd = [ping_cmd, '-n', str(count), '-w', str(timeout * 1000), ip_address]
         else:
-            cmd = ['ping', '-c', str(count), '-W', str(timeout), ip_address]
+            cmd = [ping_cmd, '-c', str(count), '-W', str(timeout), ip_address]
         
         # Run ping command
         result = subprocess.run(
@@ -1216,7 +1239,7 @@ def update_chip_statuses():
 # Build UI
 with ui.column().classes('w-full h-screen items-start justify-center gap-4 px-8'):
     with ui.row().classes('w-full items-center justify-center gap-4 mb-4'):
-        ui.label('Home Network - Control Panel v4.0.7').classes('text-2xl text-center')
+        ui.label('Home Network - Control Panel v4.0.8').classes('text-2xl text-center')
         ui.button('📋 Event Log', on_click=lambda: show_event_log()).classes('bg-gray-600 text-white')
     
     # Connection status indicator
